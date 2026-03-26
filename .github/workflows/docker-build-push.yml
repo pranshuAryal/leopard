@@ -1,0 +1,181 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - '**'   # Triggers on push to ANY branch
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 1: BUILD
+  # Builds the Docker image and saves it as a tar artifact
+  # ═══════════════════════════════════════════════════════
+  build:
+    name: 🔨 Build Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Generate tags/labels — done here so the same tags are used in push job
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/nike-tiger-landing
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+
+      # Build ONLY — no push yet (push: false, load: true saves it to local daemon)
+      - name: Build Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false      # ← Do NOT push here
+          load: true       # ← Load into local Docker daemon so we can save it
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Save all tags of the image into a single tar file
+      - name: Save Image to Tar
+        run: |
+          docker save ${{ secrets.DOCKERHUB_USERNAME }}/nike-tiger-landing \
+            -o /tmp/image.tar
+
+      # Upload the tar so Job 2 can download it on its fresh runner
+      - name: Upload Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar
+          retention-days: 1   # Only needed for the duration of this pipeline run
+
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 2: PUSH
+  # Downloads the built image and pushes it to DockerHub
+  # ═══════════════════════════════════════════════════════
+  push:
+    name: 📦 Push to DockerHub
+    runs-on: ubuntu-latest
+    needs: build   # Waits for Job 1 to succeed first
+
+    steps:
+      # Download the tar that Job 1 uploaded
+      - name: Download Image Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      # Load the image into this runner's Docker daemon
+      - name: Load Docker Image
+        run: docker load -i /tmp/image.tar
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Re-generate metadata — same inputs = same deterministic tags as Job 1
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/nike-tiger-landing
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+
+      # Push every generated tag to DockerHub
+      - name: Push Image to DockerHub
+        run: |
+          for TAG in $(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' '); do
+            echo ">>> Pushing $TAG"
+            docker push $TAG
+          done
+
+
+  # ═══════════════════════════════════════════════════════
+  # JOB 3: DEPLOY
+  # SSHs into the correct server and runs the new container
+  # ═══════════════════════════════════════════════════════
+  deploy:
+    name: 🚀 Deploy to Server
+    runs-on: ubuntu-latest
+    needs: push   # Waits for Job 2 (push) to succeed first
+
+    steps:
+      # Determine target server, domain, tag, port based on branch name
+      - name: Resolve Environment & Docker Tag
+        id: env
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          echo "Branch: $BRANCH"
+
+          if [[ "$BRANCH" == "main" ]]; then
+            echo "ssh_host=${{ secrets.PROD_SSH_HOST }}"    >> $GITHUB_OUTPUT
+            echo "domain=pranshuaryal.com.np"      >> $GITHUB_OUTPUT
+            echo "docker_tag=main"                          >> $GITHUB_OUTPUT
+            echo "container_name=leopard-prod"              >> $GITHUB_OUTPUT
+            echo "host_port=3000"                           >> $GITHUB_OUTPUT
+
+          elif [[ "$BRANCH" == "dev" ]]; then
+            echo "ssh_host=${{ secrets.DEV_SSH_HOST }}"     >> $GITHUB_OUTPUT
+            echo "domain=dev.pranshuaryal.com.np"     >> $GITHUB_OUTPUT
+            echo "docker_tag=dev"                           >> $GITHUB_OUTPUT
+            echo "container_name=leopard-dev"               >> $GITHUB_OUTPUT
+            echo "host_port=3001"                           >> $GITHUB_OUTPUT
+
+          elif [[ "$BRANCH" == feature/* ]]; then
+            SANITIZED=$(echo "$BRANCH" | sed 's/\//-/g')
+            echo "ssh_host=${{ secrets.FEATURE_SSH_HOST }}" >> $GITHUB_OUTPUT
+            echo "domain=feature.pranshuaryal.com.np"     >> $GITHUB_OUTPUT
+            echo "docker_tag=$SANITIZED"                    >> $GITHUB_OUTPUT
+            echo "container_name=leopard-feature"           >> $GITHUB_OUTPUT
+            echo "host_port=3002"                           >> $GITHUB_OUTPUT
+
+          else
+            echo "Branch '$BRANCH' has no deploy target. Skipping."
+            exit 0
+          fi
+
+      # SSH into the target server and update the container
+      - name: SSH & Deploy
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host:     ${{ steps.env.outputs.ssh_host }}
+          username: ${{ secrets.SSH_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/nike-tiger-landing:${{ steps.env.outputs.docker_tag }}"
+            CONTAINER="${{ steps.env.outputs.container_name }}"
+            PORT="${{ steps.env.outputs.host_port }}"
+
+            echo ">>> Pulling latest image: $IMAGE"
+            docker pull $IMAGE
+
+            echo ">>> Stopping old container: $CONTAINER"
+            docker stop $CONTAINER 2>/dev/null || true
+            docker rm   $CONTAINER 2>/dev/null || true
+
+            echo ">>> Starting new container on port $PORT"
+            docker run -d \
+              --name $CONTAINER \
+              --restart unless-stopped \
+              -p $PORT:3000 \
+              $IMAGE
+
+            echo ">>> ✅ Live at https://${{ steps.env.outputs.domain }}"
+
+            docker image prune -f
+
