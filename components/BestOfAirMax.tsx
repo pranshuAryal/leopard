@@ -12,7 +12,7 @@ const products = [
   },
   {
     id: 2,
-    name: 'Nike Air Max Pulse',
+    name: 'kobe',
     category: "Women's Shoes",
     price: '₹ 13,995',
     image: '/products/air-max-pulse-women.jpg',
